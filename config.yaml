@@ -1,0 +1,26 @@
+database:
+  type: postgres
+  host: localhost
+  port: 5432
+  name: arxiv_bot
+  user: tgbot
+  password: 123456789
+arxiv:
+  api_url: "http://export.arxiv.org/api/query"
+  max_results: 20 # 用户输入上限
+  user_agent: "MyArxivBot/1.0"
+  fetch_interval_hours: 6
+telegram:
+  token: "8229209647:A1231231241412N1AufQW7bT12344g"
+network:
+  use_proxy: false # 是否启用代理
+  http_proxy: "http://127.0.0.1:7890" # HTTP 代理地址
+  https_proxy: "http://127.0.0.1:7890" # HTTPS 代理地址
+  socks5_proxy: "socks5://127.0.0.1:1080" # 可选，Socks5 代理
+llm:
+  endpoint: "https://ark.cn-beijing.volces.com/api/v3/chat/completions" # LLM 服务地址
+  api_token: "cvvvvv51-bdss-4aa4-bdds-2aaaaaaaab0"
+  model: "deepseek-v3-250324"
+  timeout: 30
+llm_generation:
+  max_tags_prompt: 5
