@@ -8,7 +8,7 @@ class BaseLLMClient:
     def __init__(self,
                  endpoint: str,
                  api_token: str = None,
-                 model: str = "ep-20250701155323-xkqxr",
+                 model: str = "ep-sdfadfasdfasdf-asdfr",
                  timeout: int = 30):
         self.endpoint = endpoint
         self.api_token = api_token
@@ -43,13 +43,15 @@ class PaperAI:
     为论文提供 AI tag 和中文总结的模块
     """
 
-    def __init__(self, llm_client: BaseLLMClient):
+    def __init__(self, llm_client: BaseLLMClient, max_tags_prompt: int = 5):
         self.llm_client = llm_client
+        self.max_tags_prompt = max_tags_prompt
 
     # -----------------
     # 自动 tag 功能
     # -----------------
-    async def generate_tags(self, title: str, abstract: str, max_tags: int = 5) -> list[str]:
+    async def generate_tags(self, title: str, abstract: str) -> list[str]:
+        max_tags = self.max_tags_prompt
         messages = self._build_tag_messages(title, abstract, max_tags)
         raw_output = await self.llm_client.generate(messages)
         tags = self._parse_tags(raw_output, max_tags)
@@ -86,8 +88,6 @@ class PaperAI:
             "role": "system",
             "content": "你是一个学术论文分析助手。"
         }, {
-            "role":
-            "user",
-            "content":
-            f"请将以下论文内容总结为中文，3-5句话，保持学术风格, 使用MarkdownV2格式纯文本, 仅输出总结内容。\n标题：{title}\n摘要：{abstract}"
+            "role": "user",
+            "content": f"请将以下论文标题和摘要总结为中文，3-5句话，保持学术风格, 纯文本，仅输出总结内容。\n标题：{title}\n摘要：{abstract}"
         }]

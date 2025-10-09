@@ -2,7 +2,7 @@ from sqlalchemy import (create_engine, Column, Integer, String, Text, DateTime, 
                         JSON)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from datetime import datetime, timezone
 
 Base = declarative_base()
 
@@ -19,16 +19,14 @@ class Paper(Base):
     summary = Column(Text)
     published = Column(String(64))
     updated = Column(String(64))
-    link = Column(Text)
     category = Column(JSON)  # 列表
-    added_time = Column(DateTime, default=datetime.utcnow)
+    link = Column(Text)
+    pdf_link = Column(Text)
+    comment = Column(Text)
+    added_time = Column(DateTime, default=datetime.now(timezone.utc))
     user_notify = Column(JSON)  # 列表，存储已经通知的用户ID
     tags = Column(JSON)  # AI生成的标签，列表
     description = Column(Text)  # AI生成的简述
-
-    __table_args__ = (UniqueConstraint("arxiv_id", name="_arxiv_id_uc"), )
-    description = Column(Text)  # AI生成的简述
-
     __table_args__ = (UniqueConstraint("arxiv_id", name="_arxiv_id_uc"), )
 
 
@@ -40,9 +38,8 @@ class UserConfig(Base):
     search_queries = Column(JSON, nullable=True)
     # 存储用户的检索式，使用 JSON 格式，例如：# [{"query": "cat:cs.CL", "max_results": 10}, ...]
     since_days = Column(Integer, default=7)
-    schedule_time = Column(String(32))
     last_check = Column(String(64))
-    created_at = Column(DateTime, default=datetime.utcnow)  # 用户创建时间
+    created_at = Column(DateTime, default=datetime.now(timezone.utc))  # 用户创建时间
 
 
 # =========================

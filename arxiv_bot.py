@@ -50,16 +50,36 @@ class ArxivBot:
 
     def _register_handlers(self):
         self.app.add_handler(CommandHandler("start", self.start))
-        self.app.add_handler(CommandHandler("set_schedule", self.set_schedule))
         self.app.add_handler(CommandHandler("fetch_now", self.fetch_now))
+        self.app.add_handler(CommandHandler("show", self.show))
         self.app.add_handler(self.get_conversation_handler())
 
     # ---------------------------
     # 命令处理函数
     # ---------------------------
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        categories = ", ".join(self.config["arxiv"]["default_categories"])
-        await update.message.reply_text(f"您好！我是您的 Arxiv 机器人。\n默认类别：{categories}")
+        welcome_message = f"您好！我是您的 Arxiv 机器人。\n\n本机器人会定期为您推送最新的 **Arxiv** 论文。\n您只需要设定检索式，便可以开始接收推送。当前管理员设定的抓取间隔为 {self.fetch_interval_hours} 小时。\n\n我将通过API获取检索论文并使用AI为您生成标签和摘要。 \n\n*请注意，检索式请尽量使用all字段进行组合查询，title字段可能获取不到预期的结果。(跟网页查询存在出入)*\n我将按照发布时间降序推送。但都是最新的论文。请不用担心时间顺序。\n以下是检索式例子：\n\n`cat:cs.CV AND (all:\"object detection\")`\n"
+        await update.message.reply_text(welcome_message, parse_mode="Markdown")
+
+    async def show(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /show 命令，显示当前用户的检索式"""
+        user_id = update.effective_user.id
+
+        # 获取用户配置
+        user_config = await asyncio.to_thread(self.db.get_user_config, user_id)
+
+        message_text = []
+        message_text.append(f"当前管理员设定的抓取间隔为 {self.fetch_interval_hours} 小时。\n\n")
+
+        if not user_config or not user_config.search_queries:
+            message_text.append("您还没有设置任何检索式。使用 /set_keywords 来添加检索式。")
+        else:
+            existing_queries = user_config.search_queries
+            message_text.append("📋 您当前的检索式：\n\n")
+            for i, query_obj in enumerate(existing_queries, 1):
+                message_text.append(
+                    f"{i}. {query_obj['query']} (最大结果: {query_obj['max_results']})\n")
+        await update.message.reply_text("".join(message_text))
 
     async def set_keywords(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /set_keywords 命令"""
@@ -98,7 +118,8 @@ class ArxivBot:
         await query.answer()
 
         if query.data == "add_keyword":
-            await query.edit_message_text("请输入您要添加的检索式：")
+            prompt = "你将要输入的是检索式，[帮助](https://zhuanlan.zhihu.com/p/679538991)\n这是一个例子：\n**cat:cs.CV AND (all:\"object detection\")**\n\n请输入您要添加的检索式："
+            await query.edit_message_text(prompt, parse_mode="Markdown")
             context.user_data['setting_keywords'] = True
             return ADDING_KEYWORD
         elif query.data == "delete_keyword":
@@ -130,7 +151,7 @@ class ArxivBot:
         context.user_data['new_keyword'] = keyword_text
 
         await update.message.reply_text(f"检索式: {keyword_text}\n"
-                                        f"请输入最大检索数量 (1-100)：")
+                                        f"每次检索的结果消息上限 (1-{self.config['arxiv']['max_results']})：")
         return ADDING_MAX_RESULTS
 
     async def add_max_results(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -140,8 +161,8 @@ class ArxivBot:
         try:
             max_results = int(update.message.text.strip())
 
-            if max_results < 1 or max_results > 100:
-                await update.message.reply_text("请输入1-100之间的数字：")
+            if max_results < 1 or max_results > self.config['arxiv']['max_results']:
+                await update.message.reply_text(f"请输入1-{self.config['arxiv']['max_results']}之间的数字：")
                 return ADDING_MAX_RESULTS
 
             # 获取保存的检索式
@@ -247,22 +268,10 @@ class ArxivBot:
             fallbacks=[CommandHandler("cancel", self.cancel)],
         )
 
-    async def set_schedule(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await update.message.reply_text("用法: /set_schedule HH:MM")
-            return
-        schedule_time = context.args[0]
-        # DB is synchronous; run in thread to avoid blocking the event loop
-        await asyncio.to_thread(self.db.insert_or_update_user, update.effective_chat.id,
-                                {"schedule_time": schedule_time})
-        await update.message.reply_text(f"定时已设置为：每日 {schedule_time}")
-
     async def build_message(self, p):
-        arxiv_link = f"http://arxiv.org/abs/{p.arxiv_id}"
-        pdf_link = f"http://arxiv.org/pdf/{p.arxiv_id}"
         ar5iv_link = f"https://ar5iv.labs.arxiv.org/html/{p.arxiv_id}"
         msg_lines = [
-            f"**{p.title}**", f"Authors: {', '.join(p.authors)}", f"Published: *{p.published}*"
+            f"**{p.title}**", f"Authors: {', '.join(p.authors)}", f"Published: **{p.published}**"
         ]
         # 如果 AI 生成了 tags
         if p.tags:
@@ -270,13 +279,15 @@ class ArxivBot:
         # 如果 AI 生成了 description
         if p.description:
             msg_lines.append(f"Summary: **{p.description}**")
-        msg_lines.append(f"[Links]({arxiv_link}) | [PDF]({pdf_link}) | [Ar5iv]({ar5iv_link})")
+        msg_lines.append(f"Comment: {p.comment}")
+        msg_lines.append(f"Categories: {', '.join(p.categories)}")
+        msg_lines.append(
+            f"Continue: [Links]({p.link}) | [PDF]({p.pdf_link}) | [Ar5iv]({ar5iv_link})")
         msg = "\n".join(msg_lines)
         return msg
 
     async def fetch_now(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Fetch latest papers based on user's saved search queries"""
-        await update.message.reply_text("正在获取最新论文...")
 
         try:
             user_config = await asyncio.to_thread(self.db.get_user_config, update.effective_chat.id)
@@ -296,7 +307,6 @@ class ArxivBot:
                     max_results = sq.get("max_results", 10)
                     if not query_text:
                         continue
-
                     # 调用同步的 arxiv_client.search 放到线程中执行
                     res = await asyncio.to_thread(self.arxiv_client.search, query_text, max_results)
                     if res:
@@ -307,21 +317,12 @@ class ArxivBot:
                                 f"arxiv_client.search returned non-list for query {query_text}: {type(res)}"
                             )
             else:
-                # 用户没有设置检索式，默认获取今天的新论文
-                res = await asyncio.to_thread(self.arxiv_client.fetch_today_new)
-                if res and isinstance(res, list):
-                    papers.extend(res)
-                elif res:
-                    logger.warning(f"arxiv_client.fetch_today_new returned non-list: {type(res)}")
+                # 用户没有设置检索式，默认瞎回复
+                await update.message.reply_text("请设置您的检索式。")
         except Exception as e:
             logger.error(f"Error fetching papers: {e}")
             await update.message.reply_text("获取论文时发生错误。请稍后重试。")
             return
-
-        # if not papers:
-        #     await update.message.reply_text("未找到新论文。")
-        #     return
-        # await update.message.reply_text(f"找到 {len(papers)} 篇论文。显示结果：")
 
         for p in papers:
             chat_id = update.effective_chat.id
@@ -329,7 +330,6 @@ class ArxivBot:
             notified_users = await asyncio.to_thread(self.db.get_user_notify, p.arxiv_id)
             if chat_id in notified_users:
                 continue  # 已通知则跳过
-
             msg = await self.build_message(p)
             await update.message.reply_text(msg, parse_mode="Markdown")
             # 更新 user_notify
@@ -374,9 +374,6 @@ class ArxivBot:
                     except Exception as e:
                         logger.error(f"Error fetching papers for user {chat_id}: {e}")
                         continue
-
-                    # await self.app.bot.send_message(
-                    #     chat_id=chat_id, text=f"找到 {len(papers)} 篇论文。显示结果：")
 
                     # 只发送未通知过的论文
                     for p in papers:

@@ -20,6 +20,8 @@ class PaperEntry:
     updated: str
     categories: List[str]
     link: str
+    pdf_link: str
+    comment: str
     tags: Optional[List[str]] = None
     description: Optional[str] = None
 
@@ -28,8 +30,8 @@ class ArxivClient:
     """Arxiv API 客户端，使用 arxiv 包 + 数据库写入 (PostgreSQL)"""
 
     def __init__(self, config: dict, db: DatabaseManager, llm: PaperAI):
-        self.max_results = config.get("arxiv", {}).get("max_results", 100)
-        self.default_categories = config.get("arxiv", {}).get("default_categories", ["cs.AI"])
+        self.max_results = config.get("arxiv", {}).get("max_results", 20)
+        self.client = arxiv.Client()
         self.db = db
         self.llm = llm
 
@@ -49,7 +51,7 @@ class ArxivClient:
                                   max_results=max_results,
                                   sort_by=arxiv.SortCriterion.SubmittedDate,
                                   sort_order=arxiv.SortOrder.Descending)
-            results = list(search.results())
+            results = self.client.results(search)
         except Exception as e:
             # arxiv package/network error
             self.logger.error(f"arXiv search failed for query '{query}': {e}")
@@ -77,7 +79,7 @@ class ArxivClient:
                 except Exception as e:
                     self.logger.error(f"LLM summary generation failed for {p.arxiv_id}: {e}")
                     p.description = ""
-                self._save_to_db(p)
+            self._save_to_db(p)
         return papers
 
     def fetch_recent(self, category: str, max_results: int = None) -> List[PaperEntry]:
@@ -121,7 +123,9 @@ class ArxivClient:
         arxiv_id = entry.entry_id.split("/")[-1]
         authors = [a.name for a in entry.authors]
         categories = entry.categories or []
-        link = entry.pdf_url or entry.entry_id
+
+        link = entry.entry_id
+        pdf_link = entry.pdf_url
 
         return PaperEntry(
             arxiv_id=arxiv_id,
@@ -132,18 +136,19 @@ class ArxivClient:
             updated=entry.updated.strftime("%Y-%m-%dT%H:%M:%SZ") if entry.updated else "",
             categories=categories,
             link=link,
+            pdf_link=pdf_link or "",
+            comment=entry.comment or "",
             tags=[],
             description="")
 
     # ---------------------------
     # 数据库存储
     # ---------------------------
-    def _save_to_db(self, paper: List[PaperEntry]):
+    def _save_to_db(self, paper: PaperEntry):
         if not self.db:
             self.logger.warning("No database configured; skipping saving papers.")
             return
 
-        inserted = 0
         try:
             if self.db.paper_exists(paper.arxiv_id):
                 return
@@ -155,14 +160,14 @@ class ArxivClient:
                     "summary": paper.summary,
                     "published": paper.published,
                     "updated": paper.updated,
-                    "link": paper.link,
                     "category": paper.categories,  # 直接存 JSON
+                    "link": paper.link,
+                    "pdf_link": paper.pdf_link,
+                    "comment": paper.comment or "",
                     "tags": paper.tags or [],  # JSON 列表
                     "description": paper.description or ""
                 }
                 if self.db.insert_paper(paper_dict):
-                    inserted += 1
+                    self.logger.info(f"Inserted new papers into database.")
         except Exception as e:
             self.logger.error(f"DB error while inserting paper {paper.arxiv_id}: {e}")
-
-        self.logger.info(f"Inserted new papers into database.")

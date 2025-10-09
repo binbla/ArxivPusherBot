@@ -46,7 +46,7 @@ def main():
 
     # 4. 初始化 LLM 客户端
     llm_client = BaseLLMClient(**config["llm"])
-    arxiv_llm = PaperAI(llm_client)
+    arxiv_llm = PaperAI(llm_client, **config["llm_generation"])
     logger.info("LLM client initialized.")
 
     # 5. 初始化 Arxiv 客户端
