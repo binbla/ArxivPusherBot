@@ -2,11 +2,14 @@
 import yaml
 import os
 import logging
+import asyncio
+import multiprocessing
 
 from arxiv_database import DatabaseManager
 from arxiv_client import ArxivClient
 from arxiv_bot import ArxivBot
 from arxiv_llm import BaseLLMClient, PaperAI
+from arxiv_matrix_bot import MatrixBot
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +33,18 @@ def setup_network_proxy(config: dict):
         logger.info(f"HTTP_PROXY={os.environ.get('HTTP_PROXY')}")
         logger.info(f"HTTPS_PROXY={os.environ.get('HTTPS_PROXY')}")
         logger.info(f"ALL_PROXY={os.environ.get('ALL_PROXY')}")
+
+
+def run_telegram_bot(config, db, arxiv_client):
+    """启动 Telegram Bot"""
+    bot = ArxivBot(config, db, arxiv_client)
+    bot.run()  # 直接同步运行 Telegram bot
+
+
+def run_matrix_bot(config, db, arxiv_client):
+    """启动 Matrix Bot"""
+    matrix_bot = MatrixBot(config, db, arxiv_client)
+    matrix_bot.start_loop(interval_minutes=60)  # 每小时抓取一次，非阻塞
 
 
 def main():
@@ -56,9 +71,22 @@ def main():
     # 6. 初始化 Telegram Bot
     bot = ArxivBot(config, db, arxiv_client)
     logger.info("Telegram bot initialized. Starting...")
+    matrix_bot = MatrixBot(config, db, arxiv_client)
+    logger.info("Matrix bot initialized. Starting...")
 
-    # 7. 直接同步启动机器人（内部会处理事件循环）
-    bot.run()
+    # 6. 使用多进程启动 Telegram 和 Matrix 机器人
+    telegram_process = multiprocessing.Process(target=run_telegram_bot,
+                                               args=(config, db, arxiv_client))
+    matrix_process = multiprocessing.Process(target=run_matrix_bot, args=(config, db, arxiv_client))
+
+    telegram_process.start()
+    matrix_process.start()
+
+    # 等待进程结束
+    telegram_process.join()
+    matrix_process.join()
+
+    # bot.run()
 
 
 if __name__ == "__main__":

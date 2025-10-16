@@ -1,7 +1,11 @@
 # arxiv_bot.py
 import asyncio
 import logging
-from typing import List
+import asyncio
+import re
+import time
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, AIORateLimiter, CallbackQueryHandler, ConversationHandler, MessageHandler, filters
@@ -11,8 +15,6 @@ logging.basicConfig(level=logging.INFO)
 
 # 定义对话状态
 SETTING_KEYWORDS, ADDING_KEYWORD, ADDING_MAX_RESULTS, DELETING_KEYWORD = range(4)
-
-import re
 
 
 def escape_markdown_v2(text: str) -> str:
@@ -29,7 +31,7 @@ def escape_markdown_v2(text: str) -> str:
 
 
 class ArxivBot:
-    """Telegram Arxiv Bot，兼容 PTB 22+"""
+    """Telegram Arxiv Bot"""
 
     def __init__(self, config: dict, db, arxiv_client):
         self.config = config
@@ -37,40 +39,56 @@ class ArxivBot:
         self.arxiv_client = arxiv_client
         self.token = config["telegram"]["token"]
         self.fetch_interval_hours = config["arxiv"].get("fetch_interval_hours", 6)
+        self.session_manager = SessionManager(timeout=180)  # 会话超时 180 秒
 
         # Register post_init on the builder before building the Application
         builder = ApplicationBuilder()\
             .token(self.token)\
             .rate_limiter(AIORateLimiter())\
             .post_init(self._start_background)
-
         self.app = builder.build()
-
         self._register_handlers()
 
     def _register_handlers(self):
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("fetch_now", self.fetch_now))
         self.app.add_handler(CommandHandler("show", self.show))
-        self.app.add_handler(self.get_conversation_handler())
+        # Flow 命令
+        self.app.add_handler(CommandHandler("set_keywords", self.handle_set_keywords))
+        self.app.add_handler(CallbackQueryHandler(self.handle_callback))
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+
+    async def handle_set_keywords(self, update, context):
+        session = self.session_manager.get_or_create(update.effective_user.id)
+        flow = SetKeywordsFlow(self.db, self.config)
+        session.flow = flow
+        await flow.start(update, context, session)
+
+    async def handle_callback(self, update, context):
+        session = self.session_manager.get_or_create(update.effective_user.id)
+        if session.flow:
+            await session.flow.on_callback(update, context, session)
+
+    async def handle_message(self, update, context):
+        session = self.session_manager.get_or_create(update.effective_user.id)
+        if session.flow:
+            await session.flow.on_message(update, context, session)
+            # self.app.add_handler(self.get_conversation_handler())
 
     # ---------------------------
     # 命令处理函数
     # ---------------------------
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        welcome_message = f"您好！我是您的 Arxiv 机器人。\n\n本机器人会定期为您推送最新的 **Arxiv** 论文。\n您只需要设定检索式，便可以开始接收推送。当前管理员设定的抓取间隔为 {self.fetch_interval_hours} 小时。\n\n我将通过API获取检索论文并使用AI为您生成标签和摘要。 \n\n*请注意，检索式请尽量使用all字段进行组合查询，title字段可能获取不到预期的结果。(跟网页查询存在出入)*\n我将按照发布时间降序推送。但都是最新的论文。请不用担心时间顺序。\n以下是检索式例子：\n\n`cat:cs.CV AND (all:\"object detection\")`\n"
-        await update.message.reply_text(welcome_message, parse_mode="Markdown")
+        """处理 /start 命令，发送欢迎消息"""
+        message = "您好！我是您的 Arxiv 机器人。\n\n本机器人会定期为您推送最新的 **Arxiv** 论文。\n您只需要设定检索式，便可以开始接收推送。当前管理员设定的抓取间隔为 6 小时。\n\n我将通过API获取检索论文并使用AI为您生成标签和摘要。 \n\n*请注意，检索式请尽量使用all字段进行组合查询，title字段可能获取不到预期的结果。(跟网页查询存在出入)*\n我将按照发布时间降序推送。但都是最新的论文。请不用担心时间顺序。\n以下是检索式例子：\n\n`cat:cs.CV AND (all:\"object detection\")`\n"
+        await update.message.reply_text(message, parse_mode="Markdown")
 
-    async def show(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def show(self, update, context):
         """处理 /show 命令，显示当前用户的检索式"""
         user_id = update.effective_user.id
-
-        # 获取用户配置
         user_config = await asyncio.to_thread(self.db.get_user_config, user_id)
-
         message_text = []
         message_text.append(f"当前管理员设定的抓取间隔为 {self.fetch_interval_hours} 小时。\n\n")
-
         if not user_config or not user_config.search_queries:
             message_text.append("您还没有设置任何检索式。使用 /set_keywords 来添加检索式。")
         else:
@@ -79,194 +97,8 @@ class ArxivBot:
             for i, query_obj in enumerate(existing_queries, 1):
                 message_text.append(
                     f"{i}. {query_obj['query']} (最大结果: {query_obj['max_results']})\n")
-        await update.message.reply_text("".join(message_text))
-
-    async def set_keywords(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """处理 /set_keywords 命令"""
-        user_id = update.effective_user.id
-
-        # 获取用户配置
-        user_config = await asyncio.to_thread(self.db.get_user_config, user_id)
-
-        if not user_config or not user_config.search_queries:
-            # 没有现有的检索式，直接进入设置流程
-            await update.message.reply_text("您还没有设置任何检索式。请输入您要添加的检索式：")
-            # 保存状态到context
-            context.user_data['setting_keywords'] = True
-            return ADDING_KEYWORD
-        else:
-            # 显示现有的检索式并提供选项
-            existing_queries = user_config.search_queries
-            message_text = "📋 您当前的检索式：\n\n"
-
-            for i, query_obj in enumerate(existing_queries, 1):
-                message_text += f"{i}. {query_obj['query']} (最大结果: {query_obj['max_results']})\n"
-
-            # 创建按钮
-            keyboard = [[
-                InlineKeyboardButton("➕ 新增检索式", callback_data="add_keyword"),
-                InlineKeyboardButton("🗑️ 删除检索式", callback_data="delete_keyword")
-            ]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            await update.message.reply_text(message_text + "\n请选择操作：", reply_markup=reply_markup)
-            return SETTING_KEYWORDS
-
-    async def handle_setting_choice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """处理用户选择新增或删除"""
-        query = update.callback_query
-        await query.answer()
-
-        if query.data == "add_keyword":
-            prompt = "你将要输入的是检索式，[帮助](https://zhuanlan.zhihu.com/p/679538991)\n这是一个例子：\n**cat:cs.CV AND (all:\"object detection\")**\n\n请输入您要添加的检索式："
-            await query.edit_message_text(prompt, parse_mode="Markdown")
-            context.user_data['setting_keywords'] = True
-            return ADDING_KEYWORD
-        elif query.data == "delete_keyword":
-            user_id = query.from_user.id
-            user_config = await asyncio.to_thread(self.db.get_user_config, user_id)
-
-            if not user_config or not user_config.search_queries:
-                await query.edit_message_text("您还没有设置任何检索式。")
-                return ConversationHandler.END
-
-            existing_queries = user_config.search_queries
-
-            message_text = "请回复要删除的检索式编号：\n\n"
-            for i, query_obj in enumerate(existing_queries, 1):
-                message_text += f"{i}. {query_obj['query']} (最大结果: {query_obj['max_results']})\n"
-
-            await query.edit_message_text(message_text)
-            return DELETING_KEYWORD
-
-    async def add_keyword(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """处理添加检索式 - 第一步：接收检索式文本"""
-        keyword_text = update.message.text.strip()
-
-        if not keyword_text:
-            await update.message.reply_text("检索式不能为空，请重新输入：")
-            return ADDING_KEYWORD
-
-        # 保存检索式到context
-        context.user_data['new_keyword'] = keyword_text
-
-        await update.message.reply_text(f"检索式: {keyword_text}\n"
-                                        f"每次检索的结果消息上限 (1-{self.config['arxiv']['max_results']})：")
-        return ADDING_MAX_RESULTS
-
-    async def add_max_results(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """处理添加检索式 - 第二步：接收最大结果数量"""
-        user_id = update.effective_user.id
-
-        try:
-            max_results = int(update.message.text.strip())
-
-            if max_results < 1 or max_results > self.config['arxiv']['max_results']:
-                await update.message.reply_text(f"请输入1-{self.config['arxiv']['max_results']}之间的数字：")
-                return ADDING_MAX_RESULTS
-
-            # 获取保存的检索式
-            keyword_text = context.user_data.get('new_keyword')
-
-            if not keyword_text:
-                await update.message.reply_text("发生错误，请重新开始设置流程。")
-                return ConversationHandler.END
-
-            # 获取现有的检索式
-            user_config = await asyncio.to_thread(self.db.get_user_config, user_id)
-            existing_queries = user_config.search_queries if user_config and user_config.search_queries else []
-
-            # 检查是否已存在相同的检索式
-            for query_obj in existing_queries:
-                if query_obj['query'] == keyword_text:
-                    await update.message.reply_text(f"检索式 '{keyword_text}' 已存在！请重新输入不同的检索式：")
-                    # 清除保存的数据
-                    context.user_data.pop('new_keyword', None)
-                    return ADDING_KEYWORD
-
-            # 创建新的检索式对象
-            new_query = {"query": keyword_text, "max_results": max_results}
-
-            # 添加到现有列表
-            existing_queries.append(new_query)
-
-            # 更新数据库
-            await asyncio.to_thread(self.db.insert_or_update_user, user_id,
-                                    {"search_queries": existing_queries})
-
-            # 清除临时数据
-            context.user_data.pop('new_keyword', None)
-
-            await update.message.reply_text(f"✅ 检索式添加成功！\n"
-                                            f"📝 检索式: {keyword_text}\n"
-                                            f"📊 最大结果: {max_results}\n"
-                                            f"📋 当前共有 {len(existing_queries)} 个检索式。")
-
-        except ValueError:
-            await update.message.reply_text("请输入有效的数字：")
-            return ADDING_MAX_RESULTS
-
-        return ConversationHandler.END
-
-    async def delete_keyword(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """处理删除检索式"""
-        user_id = update.effective_user.id
-        try:
-            # 尝试解析用户输入的数字
-            delete_index = int(update.message.text.strip()) - 1
-
-            # 获取现有的检索式
-            user_config = await asyncio.to_thread(self.db.get_user_config, user_id)
-
-            if not user_config or not user_config.search_queries:
-                await update.message.reply_text("您还没有设置任何检索式。")
-                return ConversationHandler.END
-
-            existing_queries = user_config.search_queries
-
-            # 检查索引是否有效
-            if 0 <= delete_index < len(existing_queries):
-                deleted_query = existing_queries.pop(delete_index)
-
-                # 更新数据库
-                await asyncio.to_thread(self.db.insert_or_update_user, user_id,
-                                        {"search_queries": existing_queries})
-
-                await update.message.reply_text(f"🗑️ 已删除检索式: {deleted_query['query']}\n"
-                                                f"📋 剩余 {len(existing_queries)} 个检索式。")
-            else:
-                await update.message.reply_text("❌ 编号无效，请重新输入有效的编号：")
-                return DELETING_KEYWORD
-
-        except ValueError:
-            await update.message.reply_text("❌ 请输入有效的数字编号：")
-            return DELETING_KEYWORD
-
-        return ConversationHandler.END
-
-    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """取消操作"""
-        # 清除临时数据
-        context.user_data.pop('new_keyword', None)
-        context.user_data.pop('setting_keywords', None)
-
-        await update.message.reply_text("❌ 操作已取消。")
-        return ConversationHandler.END
-
-    def get_conversation_handler(self):
-        """获取对话处理器"""
-        return ConversationHandler(
-            entry_points=[CommandHandler("set_keywords", self.set_keywords)],
-            states={
-                SETTING_KEYWORDS: [CallbackQueryHandler(self.handle_setting_choice)],
-                ADDING_KEYWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_keyword)],
-                ADDING_MAX_RESULTS:
-                [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_max_results)],
-                DELETING_KEYWORD:
-                [MessageHandler(filters.TEXT & ~filters.COMMAND, self.delete_keyword)],
-            },
-            fallbacks=[CommandHandler("cancel", self.cancel)],
-        )
+        message = "".join(message_text)
+        await update.message.reply_text(message, parse_mode="Markdown")
 
     async def build_message(self, p):
         ar5iv_link = f"https://ar5iv.labs.arxiv.org/html/{p.arxiv_id}"
@@ -414,3 +246,259 @@ class ArxivBot:
         因此这里使用同步包装，避免调用者需要管理事件循环。
         """
         self.app.run_polling()
+
+
+class UserSession:
+    """管理单个用户的会话状态和交互消息"""
+
+    def __init__(self, user_id: int, timeout: int = 180):
+        self.user_id = user_id
+        self.state: str | None = None
+        self.tmp_data: Dict[str, Any] = {}
+        self._messages_to_revoke: List[Dict[str, int]] = []
+        self.timeout = timeout
+        self.last_active = time.time()
+        self.manager = None  # 在创建时注入
+
+    def touch(self):
+        """刷新活动时间"""
+        self.last_active = time.time()
+
+    def add_revoke_message(self, message):
+        """记录需要撤回的消息"""
+        if not message:
+            return
+        try:
+            self._messages_to_revoke.append({
+                "chat_id": message.chat.id,
+                "message_id": message.message_id
+            })
+        except AttributeError:
+            if isinstance(message, dict):
+                self._messages_to_revoke.append(message)
+
+    async def revoke_messages(self, bot):
+        """撤回交互消息"""
+        for msg in list(self._messages_to_revoke):
+            try:
+                await bot.delete_message(chat_id=msg["chat_id"], message_id=msg["message_id"])
+            except Exception as e:
+                logger.debug(f"撤回消息失败: {e}")
+        self._messages_to_revoke.clear()
+
+    def reset(self):
+        """重置内部状态"""
+        self.state = None
+        self.tmp_data.clear()
+
+    async def end(self, bot):
+        """由 Flow 主动结束"""
+        await self.revoke_messages(bot)
+        self.reset()
+        if self.manager:
+            self.manager.remove(self.user_id)
+
+    async def on_expire(self, bot):
+        """由 Manager 触发的超时清理"""
+        await self.revoke_messages(bot)
+        try:
+            await bot.send_message(chat_id=self.user_id, text="⚠️ 操作超时，已自动取消。")
+        except Exception as e:
+            logger.debug(f"发送超时提示失败: {e}")
+        self.reset()
+
+
+class SessionManager:
+    """统一管理所有会话生命周期"""
+
+    def __init__(self, timeout: int = 180, check_interval: float = 2.0):
+        self.timeout = timeout
+        self.check_interval = check_interval
+        self._sessions: Dict[int, UserSession] = {}
+        self._watchdog_task = None
+        self._running = False
+        self.bot = None
+
+    def attach_bot(self, bot):
+        """启动前注入 bot 实例"""
+        self.bot = bot
+
+    def start(self):
+        """启动超时检测任务"""
+        if not self._running:
+            self._running = True
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    def stop(self):
+        self._running = False
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
+
+    def get_or_create(self, user_id: int) -> UserSession:
+        session = self._sessions.get(user_id)
+        if session is None:
+            session = UserSession(user_id, timeout=self.timeout)
+            session.manager = self
+            self._sessions[user_id] = session
+            logger.info(f"创建新会话: {user_id}")
+        session.touch()
+        return session
+
+    def remove(self, user_id: int):
+        """被 session.end() 调用"""
+        if user_id in self._sessions:
+            del self._sessions[user_id]
+            logger.info(f"移除会话: {user_id}")
+
+    async def _watchdog_loop(self):
+        logger.info("Session 超时检测启动")
+        try:
+            while self._running:
+                now = time.time()
+                expired = []
+                for uid, s in list(self._sessions.items()):
+                    if now - s.last_active > s.timeout:
+                        expired.append(s)
+
+                for s in expired:
+                    logger.info(f"会话超时: {s.user_id}")
+                    if self.bot:
+                        asyncio.create_task(self._handle_expire(s))
+                await asyncio.sleep(self.check_interval)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("SessionManager 出错")
+
+    async def _handle_expire(self, session: UserSession):
+        try:
+            await session.on_expire(self.bot)
+        finally:
+            self.remove(session.user_id)
+
+
+class SetKeywordsFlow:
+    """处理 /set_keywords 命令的完整交互流程"""
+
+    def __init__(self, db, config):
+        self.db = db
+        self.config = config
+
+    async def start(self, update, context, session):
+        user_id = update.effective_user.id
+        user_cfg = await asyncio.to_thread(self.db.get_user_config, user_id)
+        session.touch()
+
+        if not user_cfg or not user_cfg.search_queries:
+            msg = await update.message.reply_text("您还没有设置任何检索式，请输入要添加的检索式：")
+            session.state = "ADDING_KEYWORD"
+            session.add_revoke_message(msg)
+            return
+
+        # 用户已有检索式
+        text = "📋 当前检索式：\n\n"
+        for i, q in enumerate(user_cfg.search_queries, 1):
+            text += f"{i}. {q['query']} (最大结果: {q['max_results']})\n"
+
+        keyboard = [[
+            InlineKeyboardButton("➕ 新增", callback_data="add_keyword"),
+            InlineKeyboardButton("🗑 删除", callback_data="delete_keyword"),
+            InlineKeyboardButton("❌ 取消", callback_data="cancel")
+        ]]
+        msg = await update.message.reply_text(text + "\n请选择操作：",
+                                              reply_markup=InlineKeyboardMarkup(keyboard))
+        session.state = "SETTING_KEYWORDS"
+        session.add_revoke_message(msg)
+
+    async def on_callback(self, update, context, session):
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+        session.touch()
+
+        if query.data == "cancel":
+            await query.edit_message_text("操作已取消。")
+            await session.end(context.bot)
+            return
+
+        if query.data == "add_keyword":
+            msg = await query.edit_message_text(
+                "请输入新的检索式：\n例如：cat:cs.CV AND (all:\"object detection\")")
+            session.state = "ADDING_KEYWORD"
+            session.add_revoke_message(msg)
+            return
+
+        if query.data == "delete_keyword":
+            user_cfg = await asyncio.to_thread(self.db.get_user_config, user_id)
+            if not user_cfg or not user_cfg.search_queries:
+                await query.edit_message_text("您还没有设置检索式。")
+                await session.end(context.bot)
+                return
+
+            text = "请输入要删除的编号：\n"
+            for i, q in enumerate(user_cfg.search_queries, 1):
+                text += f"{i}. {q['query']} (最大结果: {q['max_results']})\n"
+            msg = await query.edit_message_text(text)
+            session.state = "DELETING_KEYWORD"
+            session.add_revoke_message(msg)
+
+    async def on_message(self, update, context, session):
+        user_id = update.effective_user.id
+        text = update.message.text.strip()
+        session.touch()
+
+        # 添加检索式
+        if session.state == "ADDING_KEYWORD":
+            if not text:
+                await update.message.reply_text("检索式不能为空，请重新输入：")
+                return
+
+            session.tmp_data["new_keyword"] = text
+            msg = await update.message.reply_text(
+                f"检索式: {text}\n请输入最大结果数 (1-{self.config['arxiv']['max_results']})：")
+            session.state = "ADDING_MAX_RESULTS"
+            session.add_revoke_message(msg)
+            return
+
+        # 设置最大结果
+        if session.state == "ADDING_MAX_RESULTS":
+            try:
+                max_results = int(text)
+                if not (1 <= max_results <= self.config["arxiv"]["max_results"]):
+                    await update.message.reply_text(
+                        f"请输入1-{self.config['arxiv']['max_results']}之间的数字。")
+                    return
+
+                kw = session.tmp_data["new_keyword"]
+                user_cfg = await asyncio.to_thread(self.db.get_user_config, user_id)
+                queries = user_cfg.search_queries if user_cfg and user_cfg.search_queries else []
+                if any(q["query"] == kw for q in queries):
+                    await update.message.reply_text("该检索式已存在，请重新输入。")
+                    session.state = "ADDING_KEYWORD"
+                    return
+
+                queries.append({"query": kw, "max_results": max_results})
+                await asyncio.to_thread(self.db.insert_or_update_user, user_id,
+                                        {"search_queries": queries})
+                await update.message.reply_text(f"✅ 添加成功：{kw}（最大结果 {max_results}）")
+                await session.end(context.bot)
+            except ValueError:
+                await update.message.reply_text("请输入有效的数字。")
+            return
+
+        # 删除检索式
+        if session.state == "DELETING_KEYWORD":
+            try:
+                idx = int(text) - 1
+                user_cfg = await asyncio.to_thread(self.db.get_user_config, user_id)
+                queries = user_cfg.search_queries if user_cfg and user_cfg.search_queries else []
+                if 0 <= idx < len(queries):
+                    deleted = queries.pop(idx)
+                    await asyncio.to_thread(self.db.insert_or_update_user, user_id,
+                                            {"search_queries": queries})
+                    await update.message.reply_text(f"🗑 已删除：{deleted['query']}")
+                    await session.end(context.bot)
+                else:
+                    await update.message.reply_text("编号无效。")
+            except ValueError:
+                await update.message.reply_text("请输入数字编号。")
