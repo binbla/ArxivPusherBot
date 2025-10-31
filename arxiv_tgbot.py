@@ -4,11 +4,10 @@ import logging
 import asyncio
 import re
 import time
-from typing import Dict, Any, Optional, List
-from datetime import datetime, timedelta
+from typing import Dict, Any, List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, AIORateLimiter, CallbackQueryHandler, ConversationHandler, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, AIORateLimiter, CallbackQueryHandler, MessageHandler, filters
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -16,21 +15,17 @@ logging.basicConfig(level=logging.INFO)
 # 定义对话状态
 SETTING_KEYWORDS, ADDING_KEYWORD, ADDING_MAX_RESULTS, DELETING_KEYWORD = range(4)
 
+from telegram.helpers import escape_markdown
 
-def escape_markdown_v2(text: str) -> str:
-    """
-    转义 Telegram MarkdownV2 所有特殊字符
-    Telegram MarkdownV2 特殊字符: _ * [ ] ( ) ~ > # + - = | { } . !
-    """
-    if not text:
+
+def m2(text: str) -> str:
+    """安全地转义 MarkdownV2 文本"""
+    if text is None:
         return ""
-    # 所有需要转义的字符
-    escape_chars = r"_*[]()~>#+-=|{}.!"
-    # 使用正则转义每个特殊字符
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+    return escape_markdown(str(text), version=2)
 
 
-class ArxivBot:
+class TgBot:
     """Telegram Arxiv Bot"""
 
     def __init__(self, config: dict, db, arxiv_client):
@@ -71,17 +66,21 @@ class ArxivBot:
 
     async def handle_message(self, update, context):
         session = self.session_manager.get_or_create(update.effective_user.id)
-        if session.flow:
-            await session.flow.on_message(update, context, session)
-            # self.app.add_handler(self.get_conversation_handler())
+        # 检查用户会话是否有 flow，如果没有则创建一个默认的 flow
+        if not getattr(session, "flow", None):
+            # 接入到LLM
+            return
+        
+        # 继续处理消息
+        await session.flow.on_message(update, context, session)
 
     # ---------------------------
     # 命令处理函数
     # ---------------------------
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /start 命令，发送欢迎消息"""
-        message = "您好！我是您的 Arxiv 机器人。\n\n本机器人会定期为您推送最新的 **Arxiv** 论文。\n您只需要设定检索式，便可以开始接收推送。当前管理员设定的抓取间隔为 6 小时。\n\n我将通过API获取检索论文并使用AI为您生成标签和摘要。 \n\n*请注意，检索式请尽量使用all字段进行组合查询，title字段可能获取不到预期的结果。(跟网页查询存在出入)*\n我将按照发布时间降序推送。但都是最新的论文。请不用担心时间顺序。\n以下是检索式例子：\n\n`cat:cs.CV AND (all:\"object detection\")`\n"
-        await update.message.reply_text(message, parse_mode="Markdown")
+        message = f"您好！我是您的 Arxiv 机器人。\n\n本机器人会定期为您推送最新的 **Arxiv** 论文。\n您只需要设定检索式，便可以开始接收推送。当前管理员设定的抓取间隔为 6 小时。\n\n我将通过API获取检索论文并使用AI为您生成标签和摘要。 \n\n*请注意，检索式请尽量使用all字段进行组合查询，title字段可能获取不到预期的结果。*\n\n我将按照发布时间降序推送。但都是最新的论文。请不用担心时间顺序。\n以下是检索式例子：\n\n`{m2("cat:cs.CV AND (all:\"object detection\")")}`\n"
+        await update.message.reply_text(message, parse_mode="MarkdownV2")
 
     async def show(self, update, context):
         """处理 /show 命令，显示当前用户的检索式"""
@@ -89,83 +88,111 @@ class ArxivBot:
         user_config = await asyncio.to_thread(self.db.get_user_config, user_id)
         message_text = []
         message_text.append(f"当前管理员设定的抓取间隔为 {self.fetch_interval_hours} 小时。\n\n")
-        if not user_config or not user_config.search_queries:
-            message_text.append("您还没有设置任何检索式。使用 /set_keywords 来添加检索式。")
-        else:
-            existing_queries = user_config.search_queries
-            message_text.append("📋 您当前的检索式：\n\n")
-            for i, query_obj in enumerate(existing_queries, 1):
-                message_text.append(
-                    f"{i}. {query_obj['query']} (最大结果: {query_obj['max_results']})\n")
-        message = "".join(message_text)
-        await update.message.reply_text(message, parse_mode="Markdown")
+        try:
+            if not user_config or not user_config.search_queries:
+                message_text.append(m2("您还没有设置任何检索式。使用 /set_keywords 来添加检索式。"))
+            else:
+                existing_queries = user_config.search_queries
+                message_text.append("📋 您当前的检索式：\n\n")
+                for i, query_obj in enumerate(existing_queries, 1):
+                    message_text.append(m2(f"{i}."))
+                    message_text.append(f"`{query_obj['query']}`")
+                    message_text.append(m2(f" 最大结果: {query_obj['max_results']})\n"))
+            message = "".join(message_text)
+            await update.message.reply_text(message, parse_mode="MarkdownV2")
+        except Exception as e:
+            logger.error(f"Failed to show user config for {user_id}: {e}")
+            await update.message.reply_text("无法加载您的配置。请稍后重试。")
 
     async def build_message(self, p):
-        ar5iv_link = f"https://ar5iv.labs.arxiv.org/html/{p.arxiv_id}"
-        msg_lines = [
-            f"**{p.title}**", f"Authors: {', '.join(p.authors)}", f"Published: **{p.published}**"
-        ]
+        ar5iv_link = f"https://ar5iv.labs.arxiv.org/html/{m2(p.arxiv_id)}"
+        msg_lines = []
+        msg_lines.append(f"Ti: `{m2(p.title)}`")
+        msg_lines.append(f"Au: {m2(', '.join(author for author in p.authors))}")
+        msg_lines.append(f"Pu: **{m2(p.published)}**")
+        msg_lines.append("")  # 空行
+        # 如果 AI 生成了翻译
+        if p.translation:
+            msg_lines.append(f"Translation: {m2(p.translation)}")
         # 如果 AI 生成了 tags
         if p.tags:
-            msg_lines.append(f"Tags: {', '.join(p.tags)}")
+            msg_lines.append(f"Tags: {m2(', '.join(p.tags))}")
         # 如果 AI 生成了 description
         if p.description:
-            msg_lines.append(f"Summary: **{p.description}**")
-        msg_lines.append(f"Comment: {p.comment}")
-        msg_lines.append(f"Categories: {', '.join(p.categories)}")
+            msg_lines.append(f"Summary: **{m2(p.description)}**")
+        msg_lines.append("")  # 空行
+        msg_lines.append(m2(f"Comment: {p.comment}"))
+        msg_lines.append(m2(f"Categories: {', '.join(p.categories)}"))
         msg_lines.append(
-            f"Continue: [Links]({p.link}) | [PDF]({p.pdf_link}) | [Ar5iv]({ar5iv_link})")
+            f"Continue: [Links]({p.link}) {m2('|')} [PDF]({p.pdf_link}) {m2('|')} [Ar5iv]({ar5iv_link})"
+        )
         msg = "\n".join(msg_lines)
         return msg
 
-    async def fetch_now(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Fetch latest papers based on user's saved search queries"""
-
-        try:
-            user_config = await asyncio.to_thread(self.db.get_user_config, update.effective_chat.id)
-            search_queries = user_config.search_queries if user_config and user_config.search_queries else None
-        except Exception as e:
-            logger.error(f"Failed to get user config for {update.effective_chat.id}: {e}")
-            await update.message.reply_text("无法加载您的配置。请稍后重试。")
-            return
-
+    async def fetch_papers_for_query(self, user_id: int, query_text: str, max_results: int = 10):
+        """根据用户的查询式获取论文并发送给未通知过的用户"""
         papers: List = []
 
         try:
-            if search_queries:
-                # 遍历每条检索式
-                for sq in search_queries:
-                    query_text = sq.get("query")
-                    max_results = sq.get("max_results", 10)
-                    if not query_text:
-                        continue
-                    # 调用同步的 arxiv_client.search 放到线程中执行
-                    res = await asyncio.to_thread(self.arxiv_client.search, query_text, max_results)
-                    if res:
-                        if isinstance(res, list):
-                            papers.extend(res)
-                        else:
-                            logger.warning(
-                                f"arxiv_client.search returned non-list for query {query_text}: {type(res)}"
-                            )
+            res = await self.arxiv_client.search(query_text, max_results)
+            if isinstance(res, list):
+                papers.extend(res)
             else:
-                # 用户没有设置检索式，默认瞎回复
-                await update.message.reply_text("请设置您的检索式。")
+                logger.warning(
+                    f"arxiv_client.search returned non-list for query {query_text}: {type(res)}")
         except Exception as e:
-            logger.error(f"Error fetching papers: {e}")
-            await update.message.reply_text("获取论文时发生错误。请稍后重试。")
+            logger.error(f"Error fetching papers for query {query_text}: {e}")
+            return []
+
+        # 遍历论文，检查是否已通知过该用户
+        for paper in papers:
+            try:
+                already_sended = await asyncio.to_thread(self.db.is_sended, paper.arxiv_id, user_id)
+                if already_sended:
+                    continue  # 如果已通知过该用户，跳过
+
+                # 构建并发送消息
+                msg = await self.build_message(paper)
+                await self.app.bot.send_message(chat_id=user_id, text=msg, parse_mode="MarkdownV2")
+
+                # 更新数据库，记录已通知的用户
+                await asyncio.to_thread(self.db.sended, paper.arxiv_id, user_id)
+            except Exception as e:
+                logger.error(f"Failed to send paper {paper.arxiv_id} to user {user_id}: {e}")
+
+    async def fetch_now(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """根据用户的查询式获取最新论文并发送"""
+        user_id = update.effective_chat.id
+
+        try:
+            user_config = await asyncio.to_thread(self.db.get_user_config, user_id)
+            search_queries = user_config.search_queries if user_config and user_config.search_queries else None
+        except Exception as e:
+            logger.error(f"Failed to get user config for {user_id}: {e}")
+            await update.message.reply_text("无法加载您的配置。请稍后重试。")
             return
 
-        for p in papers:
-            chat_id = update.effective_chat.id
-            # 查询数据库中已通知用户
-            notified_users = await asyncio.to_thread(self.db.get_user_notify, p.arxiv_id)
-            if chat_id in notified_users:
-                continue  # 已通知则跳过
-            msg = await self.build_message(p)
-            await update.message.reply_text(msg, parse_mode="Markdown")
-            # 更新 user_notify
-            await asyncio.to_thread(self.db.update_user_notify, p.arxiv_id, chat_id)
+        if not search_queries:
+            await update.message.reply_text("您没有设置检索式，请设置检索式。")
+            return
+
+        # 回复用户当前的检索式
+        msg_list = []
+        msg_list.append("您一共有以下检索式：")
+        for sq in search_queries:
+            query_text = m2(sq.get("query"))
+            max_results = m2(sq.get("max_results", 10))
+            msg_list.append(f"{m2(f'-')} `{query_text}` 最大结果: {max_results}")
+        await update.message.reply_text("\n".join(msg_list),parse_mode="MarkdownV2")
+
+        # 针对每个检索式，调用 fetch_papers_for_query 处理
+        for sq in search_queries:
+            query_text = sq.get("query")
+            max_results = sq.get("max_results", 10)
+            await update.message.reply_text(f"正在根据检索式 `{m2(query_text)}` 获取最新论文",
+                                            parse_mode="MarkdownV2")
+            await self.fetch_papers_for_query(user_id, query_text, max_results)
+            await update.message.reply_text(f"该检索式的论文已全部发送。", parse_mode="MarkdownV2")
 
     # ---------------------------
     # 后台抓取任务
@@ -173,61 +200,30 @@ class ArxivBot:
     async def _background_fetch_loop(self):
         while True:
             try:
-                users = await asyncio.to_thread(self.db.get_all_users)
-                if not users:
-                    await asyncio.sleep(1)
-                    continue
+                users = await asyncio.to_thread(self.db.get_telegram_users)
+            except Exception as e:
+                logger.error(f"Failed to fetch users from DB: {e}")
+                await asyncio.sleep(1)
+                continue
 
-                for user in users:
+            if not users:
+                await asyncio.sleep(1)
+                continue
+
+            for user in users:
+                try:
                     chat_id = user.user_id
                     search_queries = user.search_queries or []
-                    papers: List = []
 
-                    try:
-                        if search_queries:
-                            for sq in search_queries:
-                                query = sq.get("query")
-                                max_results = sq.get("max_results", 10)
-                                res = await asyncio.to_thread(self.arxiv_client.search, query,
-                                                              max_results)
-                                if isinstance(res, list):
-                                    papers.extend(res)
-                                else:
-                                    logger.warning(
-                                        f"arxiv_client.search returned non-list for {query}: {type(res)}"
-                                    )
-                        else:
-                            res = await asyncio.to_thread(self.arxiv_client.fetch_today_new)
-                            if isinstance(res, list):
-                                papers.extend(res)
-                            else:
-                                logger.warning(
-                                    f"arxiv_client.fetch_today_new returned non-list: {type(res)}")
-                    except Exception as e:
-                        logger.error(f"Error fetching papers for user {chat_id}: {e}")
-                        continue
+                    # 针对每个检索式执行获取论文与发送操作
+                    for sq in search_queries:
+                        query = sq.get("query")
+                        max_results = sq.get("max_results", 10)
+                        await self.fetch_papers_for_query(chat_id, query, max_results)
 
-                    # 只发送未通知过的论文
-                    for p in papers:
-                        try:
-                            notified_users = await asyncio.to_thread(self.db.get_user_notify,
-                                                                     p.arxiv_id)
-                            if chat_id in notified_users:
-                                continue  # 已通知则跳过
-
-                            msg = await self.build_message(p)
-                            await self.app.bot.send_message(
-                                chat_id=chat_id,
-                                text=msg,
-                                parse_mode="Markdown",
-                            )
-                            # 更新 user_notify
-                            await asyncio.to_thread(self.db.update_user_notify, p.arxiv_id, chat_id)
-                        except Exception as e:
-                            logger.error(f"Failed to send message to {chat_id}: {e}")
-
-            except Exception as e:
-                logger.error(f"Error in background fetch loop: {e}")
+                except Exception as e:
+                    logger.error(f"Error fetching papers for user {user.user_id}: {e}")
+                    continue
 
             await asyncio.sleep(self.fetch_interval_hours * 3600)
 
@@ -237,7 +233,8 @@ class ArxivBot:
     async def _start_background(self, app):
         """在事件循环中创建后台抓取任务"""
         # create_task will schedule the background loop on the application's event loop
-        app.create_task(self._background_fetch_loop())
+        # app.create_task(self._background_fetch_loop())
+        asyncio.create_task(self._background_fetch_loop())
 
     def run(self):
         """启动机器人（同步）
@@ -306,6 +303,11 @@ class UserSession:
         except Exception as e:
             logger.debug(f"发送超时提示失败: {e}")
         self.reset()
+        
+    def _initialize_flow(self):
+        """检查是否有 flow，如果没有，创建一个占位 flow"""
+        if not self.flow:
+            self.flow = DefaultFlow()  # 这是一个占位流，后续可以替换为大模型对话 flow
 
 
 class SessionManager:
@@ -375,7 +377,6 @@ class SessionManager:
             await session.on_expire(self.bot)
         finally:
             self.remove(session.user_id)
-
 
 class SetKeywordsFlow:
     """处理 /set_keywords 命令的完整交互流程"""
@@ -478,8 +479,10 @@ class SetKeywordsFlow:
                     return
 
                 queries.append({"query": kw, "max_results": max_results})
-                await asyncio.to_thread(self.db.insert_or_update_user, user_id,
-                                        {"search_queries": queries})
+                await asyncio.to_thread(self.db.insert_or_update_user, user_id, {
+                    "search_queries": queries,
+                    "platform": "telegram"
+                })
                 await update.message.reply_text(f"✅ 添加成功：{kw}（最大结果 {max_results}）")
                 await session.end(context.bot)
             except ValueError:
@@ -494,11 +497,21 @@ class SetKeywordsFlow:
                 queries = user_cfg.search_queries if user_cfg and user_cfg.search_queries else []
                 if 0 <= idx < len(queries):
                     deleted = queries.pop(idx)
-                    await asyncio.to_thread(self.db.insert_or_update_user, user_id,
-                                            {"search_queries": queries})
+                    await asyncio.to_thread(self.db.insert_or_update_user, user_id, {
+                        "search_queries": queries,
+                        "platform": "telegram"
+                    })
                     await update.message.reply_text(f"🗑 已删除：{deleted['query']}")
                     await session.end(context.bot)
                 else:
                     await update.message.reply_text("编号无效。")
             except ValueError:
                 await update.message.reply_text("请输入数字编号。")
+
+class DefaultFlow:
+    """占位 Flow 类，后续可以替换为大模型对话"""
+    
+    async def on_message(self, update, context, session):
+        """处理消息"""
+        # 这里可以放一些默认的行为逻辑
+        await update.message.reply_text("默认流程：正在处理您的请求...")

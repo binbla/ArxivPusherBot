@@ -3,6 +3,7 @@ from sqlalchemy import (create_engine, Column, Integer, String, Text, DateTime, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime, timezone
+from sqlalchemy import ForeignKey, Boolean
 
 Base = declarative_base()
 
@@ -24,9 +25,9 @@ class Paper(Base):
     pdf_link = Column(Text)
     comment = Column(Text)
     added_time = Column(DateTime, default=datetime.now(timezone.utc))
-    user_notify = Column(JSON)  # 列表，存储已经通知的用户ID
     tags = Column(JSON)  # AI生成的标签，列表
     description = Column(Text)  # AI生成的简述
+    translation = Column(Text, default="")  # AI生成的摘要翻译
     __table_args__ = (UniqueConstraint("arxiv_id", name="_arxiv_id_uc"), )
 
 
@@ -34,12 +35,24 @@ class UserConfig(Base):
     __tablename__ = "user_config"
 
     user_id = Column(Integer, primary_key=True)
+    platform = Column(String(32), nullable=False, default="telegram")  # 用户来源
     description = Column(Text)
     search_queries = Column(JSON, nullable=True)
     # 存储用户的检索式，使用 JSON 格式，例如：# [{"query": "cat:cs.CL", "max_results": 10}, ...]
     since_days = Column(Integer, default=7)
     last_check = Column(String(64))
     created_at = Column(DateTime, default=datetime.now(timezone.utc))  # 用户创建时间
+
+
+class PaperUserNotify(Base):
+    __tablename__ = "paper_user_notify"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    arxiv_id = Column(String(64), ForeignKey("papers.arxiv_id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("user_config.user_id", ondelete="CASCADE"), nullable=False)
+    sent_time = Column(DateTime, default=datetime.now(timezone.utc))
+
+    __table_args__ = (UniqueConstraint("arxiv_id", "user_id", name="_paper_user_uc"), )
 
 
 # =========================
@@ -91,9 +104,30 @@ class DatabaseManager:
             session.commit()
             return True
 
-    def get_recent_papers(self, limit: int = 10):
+    def get_paper_data(self, arxiv_id: str) -> dict | None:
+        """
+        根据 arxiv_id 返回数据库里的论文原始数据字典。
+        """
         with self.Session() as session:
-            return session.query(Paper).order_by(Paper.added_time.desc()).limit(limit).all()
+            paper = session.query(Paper).filter_by(arxiv_id=arxiv_id).first()
+            if not paper:
+                return None
+
+            return {
+                "arxiv_id": paper.arxiv_id,
+                "title": paper.title,
+                "authors": paper.authors or [],
+                "summary": paper.summary or "",
+                "published": paper.published or "",
+                "updated": paper.updated or "",
+                "category": paper.category or [],
+                "link": paper.link or "",
+                "pdf_link": paper.pdf_link or "",
+                "comment": paper.comment or "",
+                "tags": paper.tags or [],
+                "description": paper.description or "",
+                "translation": paper.translation or ""
+            }
 
     def search_papers(self, keyword: str):
         with self.Session() as session:
@@ -104,35 +138,6 @@ class DatabaseManager:
     def paper_exists(self, arxiv_id: str) -> bool:
         with self.Session() as session:
             return session.query(Paper).filter_by(arxiv_id=arxiv_id).first() is not None
-
-    def get_user_notify(self, arxiv_id: str) -> list:
-        """获取已通知的用户ID列表"""
-        with self.Session() as session:
-            paper = session.query(Paper).filter_by(arxiv_id=arxiv_id).first()
-            return paper.user_notify if paper and paper.user_notify else []
-
-    def get_user_notify(self, arxiv_id: str) -> list:
-        """根据 arxiv_id 获取已通知用户列表"""
-        with self.Session() as session:
-            paper = session.query(Paper).filter(Paper.arxiv_id == arxiv_id).first()
-            if paper and paper.user_notify:
-                return paper.user_notify
-            return []
-
-    def update_user_notify(self, arxiv_id: str, user_id: int):
-        """将新的用户ID加入user_notify列表"""
-        with self.Session() as session:
-            paper = session.query(Paper).filter(Paper.arxiv_id == arxiv_id).first()
-            if not paper:
-                return False
-
-            notified = paper.user_notify or []
-            if user_id not in notified:
-                notified.append(user_id)
-                paper.user_notify = notified
-                session.commit()
-                return True
-            return False
 
     # =========================
     #  用户配置操作
@@ -174,6 +179,28 @@ class DatabaseManager:
                     user.keywords = None
             return users
 
+    def get_users_by_platform(self, platform: str):
+        """获取指定平台的所有用户配置"""
+        with self.Session() as session:
+            users = session.query(UserConfig).filter(UserConfig.platform == platform).all()
+            for user in users:
+                if user.search_queries:
+                    keywords_list = [
+                        sq.get('query', '') for sq in user.search_queries if sq.get('query')
+                    ]
+                    user.keywords = ' '.join(keywords_list)
+                else:
+                    user.keywords = None
+            return users
+
+    def get_telegram_users(self):
+        """获取所有 Telegram 用户配置"""
+        return self.get_users_by_platform("telegram")
+
+    def get_matrix_users(self):
+        """获取所有 Matrix 房间配置"""
+        return self.get_users_by_platform("matrix")
+
     def delete_user(self, user_id: int) -> bool:
         with self.Session() as session:
             user = session.query(UserConfig).filter_by(user_id=user_id).first()
@@ -182,3 +209,26 @@ class DatabaseManager:
             session.delete(user)
             session.commit()
             return True
+
+    def is_sended(self, arxiv_id: str, user_id: int) -> bool:
+        """判断该论文是否已发送给该用户"""
+        with self.Session() as session:
+            exists = session.query(PaperUserNotify).filter_by(arxiv_id=arxiv_id,
+                                                              user_id=user_id).first()
+            return exists is not None
+
+    def sended(self, arxiv_id: str, user_id: int):
+        """记录该论文已发送给用户"""
+        with self.Session() as session:
+            if self.is_sended(arxiv_id, user_id):
+                return False  # 已存在
+            record = PaperUserNotify(arxiv_id=arxiv_id, user_id=user_id)
+            session.add(record)
+            session.commit()
+            return True
+
+    def get_sended_users(self, arxiv_id: str) -> list[int]:
+        """获取已经收到该论文的用户ID列表"""
+        with self.Session() as session:
+            records = session.query(PaperUserNotify.user_id).filter_by(arxiv_id=arxiv_id).all()
+            return [r.user_id for r in records]

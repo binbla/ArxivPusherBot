@@ -1,6 +1,6 @@
-这是一个自动推送设定检索式的telegram机器人，旨在帮助用户获取最新前沿文章。
+这是一个自动推送设定检索式的 telegram 机器人，旨在帮助用户获取最新前沿文章。
 
-根据用户设定的时间，自动检索文章，并将新文章推送给用户。附带AI打tag和总结功能。推送效果如下：
+根据用户设定的时间，自动检索文章，并将新文章推送给用户。附带 AI 打 tag 和总结功能。推送效果如下：
 
 ```
 Person-Centric Annotations of LAION-400M: Auditing Bias and Its Transfer to Models
@@ -14,6 +14,7 @@ Continue: Links (http://arxiv.org/abs/2510.03721v1) | PDF (http://arxiv.org/pdf/
 ```
 
 requirement.txt
+
 ```
 telegram
 sqlalchemy
@@ -23,4 +24,23 @@ arxiv
 python-telegram-bot
 psycopg2
 "python-telegram-bot[rate-limiter]"
+"python-telegram-bot[socks]"
+pysocks
+```
+
+重置数据库
+
+```shell
+psql -U postgres -d arxiv_bot
+```
+
+```sql
+\d
+DROP TABLE IF EXISTS paper_user_notify CASCADE;
+DROP TABLE IF EXISTS papers CASCADE;
+DROP TABLE IF EXISTS user_config CASCADE;
+
+DROP TYPE IF EXISTS papers CASCADE;
+DROP TYPE IF EXISTS paper_user_notify CASCADE;
+DROP TYPE IF EXISTS user_config CASCADE;
 ```

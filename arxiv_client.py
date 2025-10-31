@@ -24,6 +24,7 @@ class PaperEntry:
     comment: str
     tags: Optional[List[str]] = None
     description: Optional[str] = None
+    translation: Optional[str] = None  # 中文摘要翻译
 
 
 class ArxivClient:
@@ -41,7 +42,7 @@ class ArxivClient:
     # ---------------------------
     # 核心功能
     # ---------------------------
-    def search(self, query: str, max_results: int = None) -> List[PaperEntry]:
+    async def search(self, query: str, max_results: int = None) -> List[PaperEntry]:
         """根据关键词搜索论文"""
         max_results = max_results or self.max_results
         self.logger.info(f"Searching arXiv for query: {query}")
@@ -53,45 +54,51 @@ class ArxivClient:
                                   sort_order=arxiv.SortOrder.Descending)
             results = self.client.results(search)
         except Exception as e:
-            # arxiv package/network error
             self.logger.error(f"arXiv search failed for query '{query}': {e}")
             return []
 
         papers = []
+        new_papers = []
         for e in results:
+            # 分流处理数据库已有和新论文
             try:
-                papers.append(self._entry_to_paper(e))
+                paper = self._entry_to_paper(e)
+                # 检查数据库是否已有
+                if self.db.paper_exists(paper.arxiv_id):
+                    # 从数据库读取 tags, description, translation
+                    db_paper = self.db.get_paper_data(paper.arxiv_id)
+                    paper.tags = db_paper["tags"]
+                    paper.description = db_paper["description"]
+                    paper.translation = db_paper["translation"]
+                else:
+                    new_papers.append(paper)
+                papers.append(paper)  # 无论新旧，都加入返回列表
             except Exception as ex:
                 self.logger.warning(f"Failed to convert arXiv entry to PaperEntry: {ex}")
 
-        # 没在数据库中且 LLM 可用时，生成 tag 和 summary 并存库
-        for p in papers:
-            if self.db.paper_exists(p.arxiv_id):
-                continue
-            if self.llm:
-                try:
-                    p.tags = asyncio.run(self.llm.generate_tags(p.title, p.summary))
-                except Exception as e:
-                    self.logger.error(f"LLM tag generation failed for {p.arxiv_id}: {e}")
-                    p.tags = []
-                try:
-                    p.description = asyncio.run(self.llm.summarize_cn(p.title, p.summary))
-                except Exception as e:
-                    self.logger.error(f"LLM summary generation failed for {p.arxiv_id}: {e}")
-                    p.description = ""
+        # 异步生成 tags, description, translation，仅对新论文
+        if self.llm and new_papers:
+            try:
+                await self.llm.enrich_papers_batch(new_papers)
+            except Exception as e:
+                self.logger.error(f"LLM enrichment failed: {e}")
+
+        # 保存新论文到数据库
+        for p in new_papers:
             self._save_to_db(p)
+
         return papers
 
-    def fetch_recent(self, category: str, max_results: int = None) -> List[PaperEntry]:
+    async def fetch_recent(self, category: str, max_results: int = None) -> List[PaperEntry]:
         """按分类抓取最新论文"""
         max_results = max_results or self.max_results
         query = f"cat:{category}"
-        return self.search(query, max_results)
+        return await self.search(query, max_results)
 
-    def fetch_today_new(self, categories: Optional[List[str]] = None) -> List[PaperEntry]:
+    async def fetch_today_new(self, categories: Optional[List[str]] = None) -> List[PaperEntry]:
         """抓取当天的新论文"""
         if categories is None:
-            categories = self.default_categories
+            categories = getattr(self, 'default_categories', [])
 
         today = datetime.utcnow().date()
         today_papers = []
@@ -99,7 +106,7 @@ class ArxivClient:
         for cat in categories:
             self.logger.info(f"Fetching new papers in {cat}")
             try:
-                papers = self.fetch_recent(cat)
+                papers = await self.fetch_recent(cat)
             except Exception as e:
                 self.logger.error(f"Failed to fetch recent papers for {cat}: {e}")
                 papers = []
@@ -139,7 +146,8 @@ class ArxivClient:
             pdf_link=pdf_link or "",
             comment=entry.comment or "",
             tags=[],
-            description="")
+            description="",
+            translation="")
 
     # ---------------------------
     # 数据库存储
@@ -152,22 +160,22 @@ class ArxivClient:
         try:
             if self.db.paper_exists(paper.arxiv_id):
                 return
-            else:
-                paper_dict = {
-                    "arxiv_id": paper.arxiv_id,
-                    "title": paper.title,
-                    "authors": paper.authors,  # 直接存 JSON
-                    "summary": paper.summary,
-                    "published": paper.published,
-                    "updated": paper.updated,
-                    "category": paper.categories,  # 直接存 JSON
-                    "link": paper.link,
-                    "pdf_link": paper.pdf_link,
-                    "comment": paper.comment or "",
-                    "tags": paper.tags or [],  # JSON 列表
-                    "description": paper.description or ""
-                }
-                if self.db.insert_paper(paper_dict):
-                    self.logger.info(f"Inserted new papers into database.")
+            paper_dict = {
+                "arxiv_id": paper.arxiv_id,
+                "title": paper.title,
+                "authors": paper.authors,
+                "summary": paper.summary,
+                "published": paper.published,
+                "updated": paper.updated,
+                "category": paper.categories,
+                "link": paper.link,
+                "pdf_link": paper.pdf_link,
+                "comment": paper.comment or "",
+                "tags": paper.tags or [],
+                "description": paper.description or "",
+                "translation": paper.translation or ""
+            }
+            if self.db.insert_paper(paper_dict):
+                self.logger.info(f"Inserted new papers into database: {paper.arxiv_id}")
         except Exception as e:
             self.logger.error(f"DB error while inserting paper {paper.arxiv_id}: {e}")
